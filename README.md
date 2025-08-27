@@ -107,7 +107,7 @@ Navigate to the `SpeedFair_simplify/` directory on each instance, then run:
 
 ```bash
 go run main.go -config="config.json" -nodes="0" \
-  -f=1 -gamma=0.9 \
+  -f=1 -gamma=1 \
   -lo-interval=250 -lo-size=100 \
   -tx-rate=400 \
   -sim-duration=60
@@ -117,7 +117,7 @@ go run main.go -config="config.json" -nodes="0" \
 
 ```bash
 go run main.go -config="config.json" -nodes="1" \
-  -f=1 -gamma=0.9 \
+  -f=1 -gamma=1 \
   -lo-interval=250 -lo-size=100 \
   -tx-rate=400 \
   -sim-duration=60
@@ -127,7 +127,7 @@ go run main.go -config="config.json" -nodes="1" \
 
 ```bash
 go run main.go -config="config.json" -nodes="2" \
-  -f=1 -gamma=0.9 \
+  -f=1 -gamma=1 \
   -lo-interval=250 -lo-size=100 \
   -tx-rate=400 \
   -sim-duration=60
@@ -137,7 +137,7 @@ go run main.go -config="config.json" -nodes="2" \
 
 ```bash
 go run main.go -config="config.json" -nodes="3" \
-  -f=1 -gamma=0.9 \
+  -f=1 -gamma=1 \
   -lo-interval=250 -lo-size=100 \
   -tx-rate=400 \
   -sim-duration=60
@@ -147,7 +147,7 @@ go run main.go -config="config.json" -nodes="3" \
 
 ```bash
 go run main.go -config="config.json" -nodes="4" \
-  -f=1 -gamma=0.9 \
+  -f=1 -gamma=1 \
   -lo-interval=250 -lo-size=100 \
   -tx-rate=400 \
   -sim-duration=60
@@ -203,5 +203,5 @@ Average Latency: 574ms (from 10850 txs)
 │   │   └── dependency.go           # Graph build, SCC, updates, finalize
 │   └── types/
 │       └── types.go                # Types & messages
-└── config.json                     # Cluster addresses (user supplied)
+└── config.json                     # Cluster addresses
 ```
