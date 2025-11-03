@@ -385,6 +385,8 @@ func main() {
 	runDistributedMode(timeoutCtx, nodesToRun, config, totalNodesFromConfig, *faultCount, *gamma, *loInterval, *loSize, *txRate)
 }
 
+
+// [来源: Pkg/Main.go]
 func runDistributedMode(ctx context.Context, nodeIDs []uint64, config map[uint64]string, totalNodes, faultCount uint64, gamma float64, loIntervalMs, loSize, txRate int) {
 	var wg sync.WaitGroup
 	services := make(map[uint64]*ofo.OFOService)
@@ -392,12 +394,15 @@ func runDistributedMode(ctx context.Context, nodeIDs []uint64, config map[uint64
 	maliciousThresholdID := totalNodes - faultCount
 
 	var submittedTxCount int32
-	var txSubmitterWg sync.WaitGroup // 保留 txSubmitterWg 用于等待
+	var txSubmitterWg sync.WaitGroup 
 
 	for _, nodeID := range nodeIDs {
 		wg.Add(1)
 		go func(id uint64) {
 			defer wg.Done()
+			
+			// 1. 创建网络
+			// [来源: Pkg/network/network.go]
 			netConfig := network.NetworkConfig{ReplicaID: id, ReplicaAddr: config}
 			net, err := network.NewDistributedNetwork(netConfig)
 			if err != nil {
@@ -406,75 +411,68 @@ func runDistributedMode(ctx context.Context, nodeIDs []uint64, config map[uint64
 			}
 			defer net.Stop()
 
-			log.Printf("Node %d waiting for peers to connect...", id)
-			// [来源: Pkg/Main.go]
-			if err := net.WaitForPeers(30 * time.Second); err != nil {
-				log.Printf("FATAL: Node %d could not connect to all peers, shutting down. Error: %v", id, err)
-				return
-			}
-            // *** 成功越过栅栏 ***
-			log.Printf("Node %d: All peers connected!", id)
-
 			isMalicious := id >= maliciousThresholdID
 			if isMalicious {
 				log.Printf("Node %d is starting as a MALICIOUS replica.", id)
 			}
-			
-			// [来源: Pkg/Main.go]
+
+			// 2. *** 关键改动: 立即创建 Service 和注册 Handler ***
+			// [来源: Pkg/ofo/service.go]
+			// NewOFOService 会自动调用 net.Register(id, s.handleMessage) 
 			service := ofo.NewOFOService(id, totalNodes, faultCount, gamma, net, loSize, loIntervalMs, isMalicious)
 			servicesMu.Lock()
 			services[id] = service
 			servicesMu.Unlock()
 
-			// <<< --- 这是关键修复 --- >>>
-			// 只有 Node 0 (Leader) 且 txRate > 0 时，才启动交易提交协程
-			// 并且这是在 WaitForPeers 成功之后！
+			// 3. *** 关键改动: Handler 注册后，再等待网络就绪 ***
+			log.Printf("Node %d waiting for peers to connect...", id)
+			if err := net.WaitForPeers(30 * time.Second); err != nil {
+				log.Printf("FATAL: Node %d could not connect to all peers...: %v", id, err)
+				return
+			}
+			log.Printf("Node %d: All peers connected!", id) // 越过栅栏
+
+
+			// 4. 只有 Node 0 在网络就绪后才开始提交
 			// [来源: Pkg/Main.go, Pkg/ofo/service.go]
 			if id == ofo.LEADER_REPLICA_ID && txRate > 0 {
 				txSubmitterWg.Add(1)
 				go func() {
 					defer txSubmitterWg.Done()
-					// [来源: Pkg/Main.go]
-					// 直接使用 'net' 实例，无需再去 map 中查找
 					submitTransactions(ctx, net, totalNodes, txRate, &submittedTxCount)
 				}()
 			}
-			// <<< --- 修复结束 --- >>>
 
-			// [来源: Pkg/Main.go]
+			// 5. 最后，启动 Service 的主循环 (LO Ticker)
+			// [来源: Pkg/ofo/service.go]
 			service.Start(ctx) 
+			
 			<-ctx.Done()
 			log.Printf("Node %d shutting down...", id)
 			service.Stop()
 		}(nodeID)
 	}
 
-	// [!! 删除 !!] 下面这段代码被移除了 ，因为它现在在 Node 0 的 goroutine 内部
+	// [!! 删除 !!] 确保旧的 submitTransactions 协程已被删除
 	/*
 		var txSubmitterWg sync.WaitGroup
-		txSubmitterWg.Add(1)
-		go func() {
-			defer txSubmitterWg.Done()
-			// ... (旧的查找 targetNet 的逻辑) ...
-			submitTransactions(ctx, targetNet, totalNodes, txRate, &submittedTxCount)
-		}()
+		...
 	*/
 
+	// 监控协程 (不变)
 	var monitorWg sync.WaitGroup
 	monitorWg.Add(1)
 	go func() {
 		defer monitorWg.Done()
 		simDurationVal, _ := strconv.Atoi(flag.Lookup("sim-duration").Value.String())
-		// [来源: Pkg/Main.go]
 		monitorSystem(ctx, services, &servicesMu, &submittedTxCount, simDurationVal)
 	}()
 
 	wg.Wait()
-	txSubmitterWg.Wait() // 等待交易提交协程结束
+	txSubmitterWg.Wait() 
 	monitorWg.Wait()
 	fmt.Println("\nAll nodes on this instance have shut down.")
-}
-			
+}			
 			
 
 func submitTransactions(ctx context.Context, net network.NetworkInterface, totalNodes uint64, txRate int, submittedCounter *int32) {
