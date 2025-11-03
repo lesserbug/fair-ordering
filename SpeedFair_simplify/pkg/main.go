@@ -391,6 +391,9 @@ func runDistributedMode(ctx context.Context, nodeIDs []uint64, config map[uint64
 	var servicesMu sync.Mutex
 	maliciousThresholdID := totalNodes - faultCount
 
+	var submittedTxCount int32
+	var txSubmitterWg sync.WaitGroup // 保留 txSubmitterWg 用于等待
+
 	for _, nodeID := range nodeIDs {
 		wg.Add(1)
 		go func(id uint64) {
@@ -404,70 +407,75 @@ func runDistributedMode(ctx context.Context, nodeIDs []uint64, config map[uint64
 			defer net.Stop()
 
 			log.Printf("Node %d waiting for peers to connect...", id)
+			// [来源: Pkg/Main.go]
 			if err := net.WaitForPeers(30 * time.Second); err != nil {
 				log.Printf("FATAL: Node %d could not connect to all peers, shutting down. Error: %v", id, err)
 				return
 			}
+            // *** 成功越过栅栏 ***
+			log.Printf("Node %d: All peers connected!", id)
 
 			isMalicious := id >= maliciousThresholdID
 			if isMalicious {
 				log.Printf("Node %d is starting as a MALICIOUS replica.", id)
 			}
+			
+			// [来源: Pkg/Main.go]
 			service := ofo.NewOFOService(id, totalNodes, faultCount, gamma, net, loSize, loIntervalMs, isMalicious)
-
 			servicesMu.Lock()
 			services[id] = service
 			servicesMu.Unlock()
 
-			service.Start(ctx)
+			// <<< --- 这是关键修复 --- >>>
+			// 只有 Node 0 (Leader) 且 txRate > 0 时，才启动交易提交协程
+			// 并且这是在 WaitForPeers 成功之后！
+			// [来源: Pkg/Main.go, Pkg/ofo/service.go]
+			if id == ofo.LEADER_REPLICA_ID && txRate > 0 {
+				txSubmitterWg.Add(1)
+				go func() {
+					defer txSubmitterWg.Done()
+					// [来源: Pkg/Main.go]
+					// 直接使用 'net' 实例，无需再去 map 中查找
+					submitTransactions(ctx, net, totalNodes, txRate, &submittedTxCount)
+				}()
+			}
+			// <<< --- 修复结束 --- >>>
 
+			// [来源: Pkg/Main.go]
+			service.Start(ctx) 
 			<-ctx.Done()
 			log.Printf("Node %d shutting down...", id)
 			service.Stop()
 		}(nodeID)
 	}
 
-	var submittedTxCount int32
-	var txSubmitterWg sync.WaitGroup
-	txSubmitterWg.Add(1)
-	go func() {
-		defer txSubmitterWg.Done()
-		var targetNet network.NetworkInterface
-		for {
-			servicesMu.Lock()
-			if len(services) > 0 {
-				for _, s := range services {
-					targetNet = s.Network()
-					break
-				}
-			}
-			servicesMu.Unlock()
-			if targetNet != nil {
-				break
-			}
-			select {
-			case <-time.After(100 * time.Millisecond):
-			case <-ctx.Done():
-				return
-			}
-		}
-		submitTransactions(ctx, targetNet, totalNodes, txRate, &submittedTxCount)
-	}()
+	// [!! 删除 !!] 下面这段代码被移除了 ，因为它现在在 Node 0 的 goroutine 内部
+	/*
+		var txSubmitterWg sync.WaitGroup
+		txSubmitterWg.Add(1)
+		go func() {
+			defer txSubmitterWg.Done()
+			// ... (旧的查找 targetNet 的逻辑) ...
+			submitTransactions(ctx, targetNet, totalNodes, txRate, &submittedTxCount)
+		}()
+	*/
 
 	var monitorWg sync.WaitGroup
 	monitorWg.Add(1)
 	go func() {
 		defer monitorWg.Done()
 		simDurationVal, _ := strconv.Atoi(flag.Lookup("sim-duration").Value.String())
-		// <<< FIX: Corrected variable name from submittedCounter to submittedTxCount >>>
+		// [来源: Pkg/Main.go]
 		monitorSystem(ctx, services, &servicesMu, &submittedTxCount, simDurationVal)
 	}()
 
 	wg.Wait()
-	txSubmitterWg.Wait()
+	txSubmitterWg.Wait() // 等待交易提交协程结束
 	monitorWg.Wait()
 	fmt.Println("\nAll nodes on this instance have shut down.")
 }
+			
+			
 
 func submitTransactions(ctx context.Context, net network.NetworkInterface, totalNodes uint64, txRate int, submittedCounter *int32) {
 	if txRate <= 0 {
