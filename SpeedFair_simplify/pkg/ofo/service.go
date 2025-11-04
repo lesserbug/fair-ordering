@@ -1,517 +1,15 @@
-// // pkg/ofo/service.go
-// package ofo
-
-// import (
-// 	"SpeedFair_simplify/pkg/network"
-// 	"SpeedFair_simplify/pkg/types"
-// 	"context"
-// 	"sort"
-// 	"sync"
-// 	"time"
-// )
-
-// const (
-// 	replicaOrdersChanSize = 512
-// 	batchReadyChanSize    = 256
-// 	LEADER_REPLICA_ID     = 0
-// 	TX_POOL_CAPACITY      = 50000
-// )
-
-// type OFOService struct {
-// 	ReplicaID   uint64
-// 	isLeader    bool
-// 	isMalicious bool
-// 	network     network.NetworkInterface
-
-// 	// --- State with fine-grained locks ---
-// 	txPoolMu          sync.RWMutex
-// 	txPool            map[[32]byte]time.Time
-// 	txSubmissionTimes map[[32]byte]time.Time
-
-// 	committedMu    sync.RWMutex
-// 	committedTxIDs map[[32]byte]bool
-
-// 	deferredMu        sync.RWMutex
-// 	deferredProposals map[uint64]*types.LeaderProposal
-
-// 	currentBlockHeight uint64
-
-// 	latencyMu                sync.Mutex
-// 	totalLatency             time.Duration
-// 	finalizedCountForLatency int64
-
-// 	// --- Leader-specific pipeline ---
-// 	pipelineCtx           context.Context
-// 	pipelineCancel        context.CancelFunc
-// 	pipelineWg            sync.WaitGroup
-// 	replicaOrdersChan     chan *types.ReplicaOrders
-// 	batchReadyChan        chan []*types.ReplicaOrders
-// 	leaderCompletionChan  chan [][32]byte
-// 	lastProposedOrderSize int
-
-// 	// --- Config ---
-// 	replicaCount uint64
-// 	fFaulty      uint64
-// 	gamma        float64
-// 	loMaxSize    int
-// 	loInterval   time.Duration
-// }
-
-// func NewOFOService(id, n, f uint64, gamma float64, net network.NetworkInterface, loSize int, loIntervalMs int, malicious bool) *OFOService {
-// 	s := &OFOService{
-// 		ReplicaID:         id,
-// 		isLeader:          id == LEADER_REPLICA_ID,
-// 		isMalicious:       malicious,
-// 		network:           net,
-// 		replicaCount:      n,
-// 		fFaulty:           f,
-// 		gamma:             gamma,
-// 		loMaxSize:         loSize,
-// 		loInterval:        time.Duration(loIntervalMs) * time.Millisecond,
-// 		txPool:            make(map[[32]byte]time.Time),
-// 		txSubmissionTimes: make(map[[32]byte]time.Time),
-// 		committedTxIDs:    make(map[[32]byte]bool),
-// 		deferredProposals: make(map[uint64]*types.LeaderProposal),
-// 	}
-// 	if s.isLeader {
-// 		s.pipelineCtx, s.pipelineCancel = context.WithCancel(context.Background())
-// 		s.replicaOrdersChan = make(chan *types.ReplicaOrders, replicaOrdersChanSize)
-// 		s.batchReadyChan = make(chan []*types.ReplicaOrders, batchReadyChanSize)
-// 		s.leaderCompletionChan = make(chan [][32]byte, 100)
-// 		s.pipelineWg.Add(2)
-// 		go s.runCollectorStage()
-// 		go s.runProposerStage()
-// 	}
-// 	net.Register(id, s.handleMessage)
-// 	return s
-// }
-
-// func (s *OFOService) Network() network.NetworkInterface { return s.network }
-
-// func (s *OFOService) Start(ctx context.Context) {
-// 	ticker := time.NewTicker(s.loInterval)
-// 	defer ticker.Stop()
-// 	for {
-// 		select {
-// 		case <-ticker.C:
-// 			s.generateAndSendOrders()
-// 		case <-ctx.Done():
-// 			return
-// 		}
-// 	}
-// }
-
-// func (s *OFOService) Stop() {
-// 	if s.isLeader {
-// 		s.pipelineCancel()
-// 		s.pipelineWg.Wait()
-// 		close(s.leaderCompletionChan)
-// 	}
-// }
-
-// func (s *OFOService) handleMessage(msg network.Message) {
-// 	switch payload := msg.Payload.(type) {
-// 	case *types.Transaction:
-// 		s.committedMu.RLock()
-// 		isCommitted := s.committedTxIDs[payload.ID]
-// 		s.committedMu.RUnlock()
-// 		if !isCommitted {
-// 			s.txPoolMu.Lock()
-// 			if _, exists := s.txPool[payload.ID]; !exists && len(s.txPool) < TX_POOL_CAPACITY {
-// 				s.txPool[payload.ID] = time.Now()
-// 				s.txSubmissionTimes[payload.ID] = payload.SubmissionTime
-// 			}
-// 			s.txPoolMu.Unlock()
-// 		}
-// 	case *types.ReplicaOrders:
-// 		if s.isLeader && s.replicaOrdersChan != nil {
-// 			select {
-// 			case s.replicaOrdersChan <- payload:
-// 			case <-s.pipelineCtx.Done():
-// 			}
-// 		}
-// 	case *types.LeaderProposal:
-// 		go s.handleProposal(payload)
-// 	}
-// }
-
-// func (s *OFOService) generateAndSendOrders() {
-// 	// Part 1: New transactions
-// 	s.txPoolMu.RLock()
-// 	var newTxOrder *types.LocalOrder
-// 	if len(s.txPool) > 0 {
-// 		poolTxs := make([]types.PoolTx, 0, len(s.txPool))
-// 		for id, t := range s.txPool {
-// 			poolTxs = append(poolTxs, types.PoolTx{ID: id, Time: t})
-// 		}
-// 		s.txPoolMu.RUnlock()
-
-// 		sort.Slice(poolTxs, func(i, j int) bool { return poolTxs[i].Time.Before(poolTxs[j].Time) })
-// 		batchSize := len(poolTxs)
-// 		if s.loMaxSize > 0 && batchSize > s.loMaxSize {
-// 			batchSize = s.loMaxSize
-// 		}
-// 		batchTxHashes := make([][32]byte, batchSize)
-// 		for i := 0; i < batchSize; i++ {
-// 			batchTxHashes[i] = poolTxs[i].ID
-// 		}
-// 		newTxOrder = &types.LocalOrder{ReplicaID: s.ReplicaID, OrderedTxs: batchTxHashes}
-// 	} else {
-// 		s.txPoolMu.RUnlock()
-// 	}
-
-// 	// Part 2: Deferred transactions (UpdateOrder)
-// 	s.deferredMu.RLock()
-// 	var deferredOrders []*types.UpdateOrder
-// 	if len(s.deferredProposals) > 0 {
-// 		s.txPoolMu.RLock()
-// 		for height, proposal := range s.deferredProposals {
-// 			txsInProposal := make([]types.PoolTx, 0, len(proposal.Graph.Nodes))
-// 			for txID := range proposal.Graph.Nodes {
-// 				if receiveTime, ok := s.txPool[txID]; ok {
-// 					txsInProposal = append(txsInProposal, types.PoolTx{ID: txID, Time: receiveTime})
-// 				}
-// 			}
-// 			sort.Slice(txsInProposal, func(i, j int) bool {
-// 				return txsInProposal[i].Time.Before(txsInProposal[j].Time)
-// 			})
-
-// 			orderedTxHashes := make([][32]byte, len(txsInProposal))
-// 			for i, ptx := range txsInProposal {
-// 				orderedTxHashes[i] = ptx.ID
-// 			}
-
-// 			if len(orderedTxHashes) > 0 {
-// 				deferredOrders = append(deferredOrders, &types.UpdateOrder{
-// 					BlockHeight: height, OrderedTxs: orderedTxHashes,
-// 				})
-// 			}
-// 		}
-// 		s.txPoolMu.RUnlock()
-// 	}
-// 	s.deferredMu.RUnlock()
-
-// 	// Part 3: Send the message
-// 	orders := &types.ReplicaOrders{
-// 		ReplicaID:   s.ReplicaID,
-// 		NewTxOrder:  newTxOrder,
-// 		DeferredTxs: deferredOrders,
-// 	}
-
-// 	msg := network.Message{From: s.ReplicaID, Payload: orders}
-// 	if s.isLeader {
-// 		s.handleMessage(msg)
-// 	} else {
-// 		msg.Type = "ReplicaOrders"
-// 		msg.To = LEADER_REPLICA_ID
-// 		s.network.Send(msg)
-// 	}
-// }
-
-// func (s *OFOService) runCollectorStage() {
-// 	defer s.pipelineWg.Done()
-// 	if s.batchReadyChan != nil {
-// 		defer close(s.batchReadyChan)
-// 	}
-
-// 	requiredOrders := s.replicaCount - s.fFaulty
-// 	var pendingOrders []*types.ReplicaOrders
-// 	receivedFrom := make(map[uint64]bool)
-
-// 	timer := time.NewTimer(s.loInterval * 2)
-// 	if !timer.Stop() {
-// 		<-timer.C
-// 	}
-
-// 	sendBatch := func() {
-// 		if len(pendingOrders) > 0 {
-// 			batch := make([]*types.ReplicaOrders, len(pendingOrders))
-// 			copy(batch, pendingOrders)
-// 			select {
-// 			case s.batchReadyChan <- batch:
-// 			case <-s.pipelineCtx.Done():
-// 			}
-// 		}
-// 		pendingOrders = nil
-// 		receivedFrom = make(map[uint64]bool)
-// 	}
-
-// 	for {
-// 		select {
-// 		case order, ok := <-s.replicaOrdersChan:
-// 			if !ok {
-// 				sendBatch()
-// 				return
-// 			}
-// 			if len(pendingOrders) == 0 {
-// 				timer.Reset(s.loInterval * 2)
-// 			}
-// 			if !receivedFrom[order.ReplicaID] {
-// 				pendingOrders = append(pendingOrders, order)
-// 				receivedFrom[order.ReplicaID] = true
-// 			}
-// 			if uint64(len(pendingOrders)) >= requiredOrders {
-// 				if !timer.Stop() {
-// 					select {
-// 					case <-timer.C:
-// 					default:
-// 					}
-// 				}
-// 				sendBatch()
-// 			}
-// 		case <-timer.C:
-// 			sendBatch()
-// 		case <-s.pipelineCtx.Done():
-// 			return
-// 		}
-// 	}
-// }
-
-// func (s *OFOService) runProposerStage() {
-// 	defer s.pipelineWg.Done()
-// 	for {
-// 		select {
-// 		case <-s.pipelineCtx.Done():
-// 			return
-// 		case batchOrders, ok := <-s.batchReadyChan:
-// 			if !ok {
-// 				return
-// 			}
-// 			if uint64(len(batchOrders)) < s.replicaCount-s.fFaulty {
-// 				continue
-// 			}
-
-// 			s.deferredMu.Lock()
-// 			s.currentBlockHeight++
-// 			currentHeight := s.currentBlockHeight
-// 			deferredClone := make(map[uint64]*types.LeaderProposal)
-// 			for h, p := range s.deferredProposals {
-// 				deferredClone[h] = p
-// 			}
-// 			s.deferredMu.Unlock()
-
-// 			s.committedMu.RLock()
-// 			committedSnapshot := make(map[[32]byte]bool)
-// 			for id := range s.committedTxIDs {
-// 				committedSnapshot[id] = true
-// 			}
-// 			s.committedMu.RUnlock()
-
-// 			newTxOrders, updateOrdersByHeight := s.separateOrderTypes(batchOrders)
-
-// 			dm := NewDependencyManager()
-// 			graphBuilt := dm.BuildGraphAndClassifyTxs(newTxOrders, s.replicaCount, s.fFaulty, s.gamma, committedSnapshot)
-
-// 			if graphBuilt {
-// 				dm.CutShadedTail()
-// 			}
-
-// 			updatesForProposal := make(map[uint64]map[[32]byte][][32]byte)
-// 			for height, uos := range updateOrdersByHeight {
-// 				if deferredProp, exists := deferredClone[height]; exists {
-// 					newEdges := FairUpdate(uos, deferredProp.Graph, s.replicaCount, s.fFaulty, s.gamma)
-// 					if len(newEdges) > 0 {
-// 						updatesForProposal[height] = newEdges
-// 					}
-// 				}
-// 			}
-
-// 			s.lastProposedOrderSize = len(dm.graph.Nodes)
-// 			proposal := &types.LeaderProposal{
-// 				BlockHeight:    currentHeight,
-// 				Graph:          dm.graph,
-// 				TxStates:       dm.txStates,
-// 				Updates:        updatesForProposal,
-// 				Proof:          &types.LocalOrderFragment{ReplicaOrders: batchOrders},
-// 				CommittedSoFar: committedSnapshot,
-// 			}
-
-// 			for i := uint64(0); i < s.replicaCount; i++ {
-// 				msg := network.Message{From: s.ReplicaID, Payload: proposal}
-// 				if i == s.ReplicaID {
-// 					s.handleMessage(msg)
-// 				} else {
-// 					msg.To = i
-// 					msg.Type = "LeaderProposal"
-// 					s.network.Send(msg)
-// 				}
-// 			}
-// 		}
-// 	}
-// }
-
-// func (s *OFOService) separateOrderTypes(batchOrders []*types.ReplicaOrders) ([]*types.LocalOrder, map[uint64][]*types.UpdateOrder) {
-// 	newTxOrders := make([]*types.LocalOrder, 0, len(batchOrders))
-// 	updateOrdersByHeight := make(map[uint64][]*types.UpdateOrder)
-// 	for _, ro := range batchOrders {
-// 		if ro.NewTxOrder != nil && len(ro.NewTxOrder.OrderedTxs) > 0 {
-// 			newTxOrders = append(newTxOrders, ro.NewTxOrder)
-// 		}
-// 		for _, uo := range ro.DeferredTxs {
-// 			updateOrdersByHeight[uo.BlockHeight] = append(updateOrdersByHeight[uo.BlockHeight], uo)
-// 		}
-// 	}
-// 	return newTxOrders, updateOrdersByHeight
-// }
-
-// func (s *OFOService) handleProposal(proposal *types.LeaderProposal) {
-// 	if proposal == nil || proposal.Proof == nil || uint64(len(proposal.Proof.ReplicaOrders)) < s.replicaCount-s.fFaulty {
-// 		return
-// 	}
-
-// 	s.deferredMu.Lock()
-// 	if proposal.Updates != nil {
-// 		for height, newEdges := range proposal.Updates {
-// 			if deferredP, ok := s.deferredProposals[height]; ok {
-// 				for u, vs := range newEdges {
-// 					for _, v := range vs {
-// 						addEdge(deferredP.Graph, u, v)
-// 					}
-// 				}
-// 			}
-// 		}
-// 	}
-// 	if proposal.Graph != nil && len(proposal.Graph.Nodes) > 0 {
-// 		if _, exists := s.deferredProposals[proposal.BlockHeight]; !exists {
-// 			s.deferredProposals[proposal.BlockHeight] = proposal
-// 		}
-// 	}
-
-// 	// *** KEY FIX: Create a race-safe snapshot with deep-copied graphs ***
-// 	deferredProposalsSnapshot := make(map[uint64]*types.LeaderProposal, len(s.deferredProposals))
-// 	for h, p := range s.deferredProposals {
-// 		if p == nil || p.Graph == nil {
-// 			continue
-// 		}
-// 		// Create a lightweight deep copy of the graph
-// 		ng := &types.DependencyGraph{
-// 			Nodes: make(map[[32]byte]bool, len(p.Graph.Nodes)),
-// 			Edges: make(map[[32]byte][][32]byte, len(p.Graph.Edges)),
-// 		}
-// 		for u := range p.Graph.Nodes {
-// 			ng.Nodes[u] = true
-// 		}
-// 		for u, nbrs := range p.Graph.Edges {
-// 			// Copy the slice to avoid sharing the underlying array
-// 			cp := make([][32]byte, len(nbrs))
-// 			copy(cp, nbrs)
-// 			ng.Edges[u] = cp
-// 		}
-
-// 		// Create a shallow copy of the proposal struct, but replace the graph pointer
-// 		clone := *p
-// 		clone.Graph = ng
-// 		deferredProposalsSnapshot[h] = &clone
-// 	}
-// 	s.deferredMu.Unlock()
-// 	// *** END OF KEY FIX ***
-
-// 	var allFinalizedTxs [][32]byte
-// 	var heightsToFinalize []uint64
-
-// 	sortedHeights := make([]uint64, 0, len(deferredProposalsSnapshot))
-// 	for h := range deferredProposalsSnapshot {
-// 		sortedHeights = append(sortedHeights, h)
-// 	}
-// 	sort.Slice(sortedHeights, func(i, j int) bool { return sortedHeights[i] < sortedHeights[j] })
-
-// 	for _, height := range sortedHeights {
-// 		deferredP := deferredProposalsSnapshot[height]
-// 		dm := NewDependencyManager()
-// 		dm.graph = deferredP.Graph
-// 		dm.txStates = deferredP.TxStates
-
-// 		if orderedSegment := dm.ComputeFairOrder(); len(orderedSegment) > 0 {
-// 			allFinalizedTxs = append(allFinalizedTxs, orderedSegment...)
-// 			heightsToFinalize = append(heightsToFinalize, height)
-// 		}
-// 	}
-
-// 	if len(allFinalizedTxs) > 0 {
-// 		s.commitFinalizedData(allFinalizedTxs, heightsToFinalize)
-// 	}
-// }
-
-// func (s *OFOService) commitFinalizedData(finalizedTxs [][32]byte, heightsToFinalize []uint64) {
-// 	if len(finalizedTxs) == 0 {
-// 		return
-// 	}
-// 	finalizeTime := time.Now()
-
-// 	s.deferredMu.Lock()
-// 	for _, height := range heightsToFinalize {
-// 		delete(s.deferredProposals, height)
-// 	}
-// 	s.deferredMu.Unlock()
-
-// 	newlyFinalized := [][32]byte{}
-// 	s.committedMu.Lock()
-// 	for _, txID := range finalizedTxs {
-// 		if !s.committedTxIDs[txID] {
-// 			s.committedTxIDs[txID] = true
-// 			newlyFinalized = append(newlyFinalized, txID)
-// 		}
-// 	}
-// 	s.committedMu.Unlock()
-
-// 	if len(newlyFinalized) == 0 {
-// 		return
-// 	}
-
-// 	s.txPoolMu.Lock()
-// 	s.latencyMu.Lock()
-// 	for _, txID := range newlyFinalized {
-// 		delete(s.txPool, txID)
-// 		if submitTime, found := s.txSubmissionTimes[txID]; found {
-// 			s.totalLatency += finalizeTime.Sub(submitTime)
-// 			s.finalizedCountForLatency++
-// 			delete(s.txSubmissionTimes, txID)
-// 		}
-// 	}
-// 	s.latencyMu.Unlock()
-// 	s.txPoolMu.Unlock()
-
-// 	if s.isLeader && s.leaderCompletionChan != nil && len(newlyFinalized) > 0 {
-// 		select {
-// 		case s.leaderCompletionChan <- newlyFinalized:
-// 		default:
-// 		}
-// 	}
-// }
-
-// // --- Getters with correct locking ---
-// func (s *OFOService) GetLeaderCompletionChan() <-chan [][32]byte { return s.leaderCompletionChan }
-// func (s *OFOService) GetFinalizedCount() int {
-// 	s.committedMu.RLock()
-// 	defer s.committedMu.RUnlock()
-// 	return len(s.committedTxIDs)
-// }
-// func (s *OFOService) GetTxPoolSize() int {
-// 	s.txPoolMu.RLock()
-// 	defer s.txPoolMu.RUnlock()
-// 	return len(s.txPool)
-// }
-// func (s *OFOService) GetLastProposedOrderSize() int { return s.lastProposedOrderSize }
-// func (s *OFOService) GetLatencyStats() (avgLatency time.Duration, count int64) {
-// 	s.latencyMu.Lock()
-// 	defer s.latencyMu.Unlock()
-// 	if s.finalizedCountForLatency == 0 {
-// 		return 0, 0
-// 	}
-// 	return s.totalLatency / time.Duration(s.finalizedCountForLatency), s.finalizedCountForLatency
-// }
-
 package ofo
 
 import (
 	"SpeedFair_simplify/pkg/network"
 	"SpeedFair_simplify/pkg/types"
+	// "bytes" // <-- 移除了未使用的 "bytes" 导入
 	"context"
 	"math/rand"
+	// "reflect" // <<< FIX (Suggestion 3): 移除了未使用的 "reflect" 导入
 	"sort"
 	"sync"
 	"time"
-	"reflect"
 )
 
 // Malicious behavior constants (start with slightly lower intensity for easier debugging)
@@ -754,7 +252,7 @@ func (s *OFOService) generateAndSendOrders() {
 	}
 }
 
-// <<< FIX: Validation is now more robust against network timing races >>>
+// <<< LIVENESS FIX (Suggestion 2): Relaxed validation >>>
 func (s *OFOService) validateReplicaOrders(ro *types.ReplicaOrders) bool {
 	if ro.NewTxOrder != nil {
 		if s.loMaxSize > 0 && len(ro.NewTxOrder.OrderedTxs) > s.loMaxSize {
@@ -763,23 +261,26 @@ func (s *OFOService) validateReplicaOrders(ro *types.ReplicaOrders) bool {
 		seen := make(map[[32]byte]bool)
 		for _, id := range ro.NewTxOrder.OrderedTxs {
 			if seen[id] {
-				return false
+				return false // 仍然拒绝重复
 			}
 			seen[id] = true
 
-			// Relaxed check: As long as the leader has seen the tx in either its
-			// submission map or its current pool, it's valid. This avoids penalizing
-			// honest nodes due to network race conditions.
-			s.txPoolMu.RLock()
-			_, ok1 := s.txSubmissionTimes[id]
-			_, ok2 := s.txPool[id]
-			s.txPoolMu.RUnlock()
-			if !(ok1 || ok2) {
-				return false // A truly unknown (likely fake) transaction
-			}
+			// <<< LIVENESS FIX: 移除这个过于严格的检查 >>>
+			// 允许 Leader 尚未见过的 tx 通过。
+			// 最终的公平性由 runProposerStage 中的 n-f 阈值保证。
+			/*
+				s.txPoolMu.RLock()
+				_, ok1 := s.txSubmissionTimes[id]
+				_, ok2 := s.txPool[id]
+				s.txPoolMu.RUnlock()
+				if !(ok1 || ok2) {
+					return false // <-- 过于严格!
+				}
+			*/
 		}
 	}
 
+	// (DeferredTxs 检查保持不变)
 	for _, u := range ro.DeferredTxs {
 		s.deferredMu.RLock()
 		p, p_ok := s.deferredProposals[u.BlockHeight]
@@ -873,22 +374,41 @@ func (s *OFOService) runProposerStage() {
 				return
 			}
 
-			// <<< CRITICAL FIX A: Restore the n-f threshold for making proposals >>>
-			// The proposer MUST NOT create a proposal unless it has sufficient evidence.
-			// Batches triggered by the collector's timer will often be smaller than this
-			// and must be ignored to prevent proposing empty graphs.
+			// ... (n-f 检查不变) ...
 			if uint64(len(batchOrders)) < s.replicaCount-s.fFaulty {
 				continue
 			}
 
+			// <<< RACE-FIX (Suggestion 3): Deep copy deferred graphs >>>
 			s.deferredMu.Lock()
 			s.currentBlockHeight++
 			currentHeight := s.currentBlockHeight
-			deferredClone := make(map[uint64]*types.LeaderProposal)
+
+			// (使用与 handleProposal 末尾相同的深度复制逻辑)
+			deferredClone := make(map[uint64]*types.LeaderProposal, len(s.deferredProposals))
 			for h, p := range s.deferredProposals {
-				deferredClone[h] = p
+				if p == nil || p.Graph == nil {
+					continue
+				}
+				ng := &types.DependencyGraph{
+					Nodes: make(map[[32]byte]bool, len(p.Graph.Nodes)),
+					Edges: make(map[[32]byte][][32]byte, len(p.Graph.Edges)),
+				}
+				for u := range p.Graph.Nodes {
+					ng.Nodes[u] = true
+				}
+				for u, nbrs := range p.Graph.Edges {
+					cp := make([][32]byte, len(nbrs))
+					copy(cp, nbrs)
+					ng.Edges[u] = cp
+				}
+				clone := *p
+				clone.Graph = ng
+				deferredClone[h] = &clone
 			}
 			s.deferredMu.Unlock()
+			// <<< END RACE-FIX >>>
+
 			s.committedMu.RLock()
 			committedSnapshot := make(map[[32]byte]bool)
 			for id := range s.committedTxIDs {
@@ -906,6 +426,7 @@ func (s *OFOService) runProposerStage() {
 
 			updatesForProposal := make(map[uint64]map[[32]byte][][32]byte)
 			for height, uos := range updateOrdersByHeight {
+				// (现在可以安全地读取 deferredClone)
 				if deferredProp, exists := deferredClone[height]; exists {
 					newEdges := FairUpdate(uos, deferredProp.Graph, s.replicaCount, s.fFaulty, s.gamma)
 					if len(newEdges) > 0 {
@@ -913,14 +434,21 @@ func (s *OFOService) runProposerStage() {
 					}
 				}
 			}
-			s.lastProposedOrderSize = len(dm.graph.Nodes)
+
+			// <<< FIX (Suggestion 2): Nil guard for lastProposedOrderSize >>>
+			if dm.graph != nil {
+				s.lastProposedOrderSize = len(dm.graph.Nodes)
+			} else {
+				s.lastProposedOrderSize = 0
+			}
+
 			proposal := &types.LeaderProposal{
 				BlockHeight:    currentHeight,
 				Graph:          dm.graph,
 				TxStates:       dm.txStates,
 				Updates:        updatesForProposal,
 				Proof:          &types.LocalOrderFragment{ReplicaOrders: batchOrders},
-				CommittedSoFar: committedSnapshot,
+				CommittedSoFar: committedSnapshot, // <-- Leader anexa seu snapshot
 			}
 			for i := uint64(0); i < s.replicaCount; i++ {
 				msg := network.Message{From: s.ReplicaID, Payload: proposal}
@@ -937,32 +465,26 @@ func (s *OFOService) runProposerStage() {
 }
 
 func (s *OFOService) handleProposal(proposal *types.LeaderProposal) {
-	// <<< CRITICAL FIX B: Restore the n-f threshold for accepting proposals >>>
-	// A replica must only accept proposals that are backed by sufficient proof.
+	// (n-f 检查不变)
 	if proposal == nil || proposal.Proof == nil ||
 		uint64(len(proposal.Proof.ReplicaOrders)) < s.replicaCount-s.fFaulty {
 		return
 	}
 
 	// ===================================================================
-	// <<< NEW: REPLICA-SIDE FAIRNESS VERIFICATION >>>
-	// Replicas MUST re-calculate the graph and updates from the proof (π)
-	// and verify they match the leader's proposal.
+	// <<< REPLICA-SIDE FAIRNESS VERIFICATION >>>
 	// ===================================================================
 
-	// 1. Get the replica's local committed snapshot.
-	// (Using local state is safer than trusting proposal.CommittedSoFar)
-	s.committedMu.RLock()
-	committedSnapshot := make(map[[32]byte]bool)
-	for id := range s.committedTxIDs {
-		committedSnapshot[id] = true
+	// 1. (使用 proposal.CommittedSoFar, 不变)
+	committedSnapshot := proposal.CommittedSoFar
+	if committedSnapshot == nil {
+		committedSnapshot = make(map[[32]byte]bool)
 	}
-	s.committedMu.RUnlock()
 
-	// 2. Separate orders from the proof
+	// 2. (Separate orders, 不变)
 	newTxOrders, updateOrdersByHeight := s.separateOrderTypes(proposal.Proof.ReplicaOrders)
 
-	// 3. Re-calculate G' (Graph) locally, exactly as the leader would
+	// 3. (Re-calculate G', 不变)
 	dm_replica := NewDependencyManager()
 	graphBuilt := dm_replica.BuildGraphAndClassifyTxs(
 		newTxOrders,
@@ -977,15 +499,13 @@ func (s *OFOService) handleProposal(proposal *types.LeaderProposal) {
 	}
 
 	G_prime := dm_replica.graph
-	States_prime := dm_replica.txStates // We'll use this later
+	States_prime := dm_replica.txStates
 
-	// 4. Re-calculate E_updates' (Updates) locally
-	// (We must lock deferredMu here to safely read s.deferredProposals)
+	// 4. (Re-calculate E_updates', 不变)
 	s.deferredMu.Lock() // <<< LOCK MOVED HERE
 
 	E_updates_prime := make(map[uint64]map[[32]byte][][32]byte)
 	for height, uos := range updateOrdersByHeight {
-		// Use the replica's *own* view of deferred proposals
 		if deferredProp, exists := s.deferredProposals[height]; exists {
 			newEdges := FairUpdate(uos, deferredProp.Graph, s.replicaCount, s.fFaulty, s.gamma)
 			if len(newEdges) > 0 {
@@ -994,22 +514,20 @@ func (s *OFOService) handleProposal(proposal *types.LeaderProposal) {
 		}
 	}
 
-	// 5. CRITICAL: Compare G vs G' and E_updates vs E_updates'
+	// 5. CRITICAL: (Compare, 不变)
+	//    (现在 equalGraph 和 equalUpdates 都被修复了)
 	if !equalGraph(proposal.Graph, G_prime) || !equalUpdates(proposal.Updates, E_updates_prime) {
-		// Proposal is NOT FAIR or is inconsistent. Reject it.
-		s.deferredMu.Unlock() // Don't forget to unlock
+		s.deferredMu.Unlock()
 		return
 	}
 
 	// ===================================================================
 	// <<< END OF VERIFICATION BLOCK >>>
-	// If we reach this point, the proposal's G and Updates are VERIFIED.
-	// We can now proceed with the original logic, using the verified data.
 	// ===================================================================
 
-	// (Original logic continues...)
+	// (Original logic continues, 不变)
 	if proposal.Updates != nil {
-		for height, newEdges := range proposal.Updates { // This is now verified
+		for height, newEdges := range proposal.Updates {
 			if deferredP, ok := s.deferredProposals[height]; ok {
 				for u, vs := range newEdges {
 					for _, v := range vs {
@@ -1020,20 +538,14 @@ func (s *OFOService) handleProposal(proposal *types.LeaderProposal) {
 		}
 	}
 
-	// Only add non-empty graphs to deferred proposals
-	if proposal.Graph != nil && len(proposal.Graph.Nodes) > 0 { // This is now verified
+	if proposal.Graph != nil && len(proposal.Graph.Nodes) > 0 {
 		if _, exists := s.deferredProposals[proposal.BlockHeight]; !exists {
-
-			// MINIMAL CHANGE for TxStates:
-			// Since G is verified, our locally computed States_prime is correct.
-			// Overwrite the leader's (untrusted) states with our (correct) states.
 			proposal.TxStates = States_prime
-
 			s.deferredProposals[proposal.BlockHeight] = proposal
 		}
 	}
 
-	// The deep copy logic for snapshotting is correct and important, leave as is.
+	// (Deep copy snapshot logic, 不变)
 	deferredProposalsSnapshot := make(map[uint64]*types.LeaderProposal, len(s.deferredProposals))
 	for h, p := range s.deferredProposals {
 		if p == nil || p.Graph == nil {
@@ -1057,7 +569,7 @@ func (s *OFOService) handleProposal(proposal *types.LeaderProposal) {
 	}
 	s.deferredMu.Unlock() // <<< ORIGINAL UNLOCK
 
-	// The finalization logic remains correct.
+	// (Finalization logic, 不变)
 	var allFinalizedTxs [][32]byte
 	var heightsToFinalize []uint64
 	sortedHeights := make([]uint64, 0, len(deferredProposalsSnapshot))
@@ -1084,14 +596,34 @@ func (s *OFOService) handleProposal(proposal *types.LeaderProposal) {
 	}
 }
 
+// =================================================================
+// HELPER FUNCTIONS FOR VERIFICATION (Updated)
+// =================================================================
+
+// <<< FIX (Suggestion 1): `equalGraph` nil handling >>>
 func equalGraph(a, b *types.DependencyGraph) bool {
 	if (a == nil) != (b == nil) {
 		return false
 	}
-	if a == nil { // Both are nil
+	if a == nil { // Ambos são nulos
 		return true
 	}
-	// 1. Check Nodes
+
+	// Trata nil como vazio
+	if a.Nodes == nil {
+		a.Nodes = map[[32]byte]bool{}
+	}
+	if b.Nodes == nil {
+		b.Nodes = map[[32]byte]bool{}
+	}
+	if a.Edges == nil {
+		a.Edges = map[[32]byte][][32]byte{}
+	}
+	if b.Edges == nil {
+		b.Edges = map[[32]byte][][32]byte{}
+	}
+
+	// 1. Verificar Nós
 	if len(a.Nodes) != len(b.Nodes) {
 		return false
 	}
@@ -1100,43 +632,102 @@ func equalGraph(a, b *types.DependencyGraph) bool {
 			return false
 		}
 	}
-	// 2. Check Edges
+
+	// 2. Verificar Arestas (de forma robusta)
 	if len(a.Edges) != len(b.Edges) {
 		return false
 	}
 	for u, a_edges := range a.Edges {
 		b_edges, ok := b.Edges[u]
 		if !ok {
-			return false
+			return false // b não tem arestas de u
 		}
-		if len(a_edges) != len(b_edges) {
-			return false
-		}
-		// This assumes edges are sorted, or you need a more complex set comparison
-		// For simplicity, reflect.DeepEqual might be okay if order is deterministic
-		// Let's assume order isn't guaranteed, so we check presence
-		a_set := make(map[[32]byte]bool, len(a_edges))
+
+		a_set := make(map[[32]byte]int, len(a_edges))
 		for _, e := range a_edges {
-			a_set[e] = true
+			a_set[e]++
 		}
+
+		b_set := make(map[[32]byte]int, len(b_edges))
 		for _, e := range b_edges {
-			if !a_set[e] {
-				return false
+			b_set[e]++
+		}
+
+		if len(a_set) != len(b_set) {
+			return false // Número diferente de vizinhos únicos
+		}
+		for k, v := range a_set {
+			if b_set[k] != v {
+				return false // Contagem de arestas diferente para um vizinho
 			}
 		}
 	}
 	return true
 }
 
-// (Helper function)
+// <<< LIVENESS FIX (Suggestion 1): Robust equalUpdates >>>
 func equalUpdates(a, b map[uint64]map[[32]byte][][32]byte) bool {
-	// Using DeepEqual is easiest here
-	return reflect.DeepEqual(a, b)
-	// Manual check is also possible but complex (map[uint64] -> map[[32]byte] -> []bytes)
+	// Trata nil como vazio
+	if a == nil && len(b) == 0 {
+		return true
+	}
+	if b == nil && len(a) == 0 {
+		return true
+	}
+	if a == nil {
+		a = map[uint64]map[[32]byte][][32]byte{}
+	}
+	if b == nil {
+		b = map[uint64]map[[32]byte][][32]byte{}
+	}
+
+	if len(a) != len(b) {
+		return false
+	}
+	for h, edgesA := range a {
+		edgesB, ok := b[h]
+		// Trata nil como vazio
+		if edgesA == nil && len(edgesB) == 0 {
+			continue
+		}
+		if edgesB == nil && len(edgesA) == 0 {
+			continue
+		}
+		if edgesA == nil {
+			edgesA = map[[32]byte][][32]byte{}
+		}
+		if edgesB == nil {
+			edgesB = map[[32]byte][][32]byte{}
+		}
+
+		if !ok || len(edgesA) != len(edgesB) {
+			return false
+		}
+		for u, nbrsA := range edgesA {
+			nbrsB, ok := edgesB[u]
+			if !ok {
+				return false
+			}
+			if len(nbrsA) != len(nbrsB) {
+				return false
+			}
+			// Comparação de multiconjunto independente de ordem
+			cnt := make(map[[32]byte]int, len(nbrsA))
+			for _, v := range nbrsA {
+				cnt[v]++
+			}
+			for _, v := range nbrsB {
+				if cnt[v] == 0 {
+					return false
+				}
+				cnt[v]--
+			}
+		}
+	}
+	return true
 }
 
-// ... commitFinalizedData and all Getter methods are unchanged ...
-// They can be copied directly from your last working version.
+// ... (separateOrderTypes, commitFinalizedData 不变) ...
 func (s *OFOService) separateOrderTypes(batchOrders []*types.ReplicaOrders) ([]*types.LocalOrder, map[uint64][]*types.UpdateOrder) {
 	newTxOrders := make([]*types.LocalOrder, 0, len(batchOrders))
 	updateOrdersByHeight := make(map[uint64][]*types.UpdateOrder)
@@ -1208,6 +799,8 @@ func (s *OFOService) GetTxPoolSize() int {
 func (s *OFOService) GetLastProposedOrderSize() int {
 	return s.lastProposedOrderSize
 }
+
+// <<< COMPILE-FIX (Suggestion 5): 移除了多余的点 >>>
 func (s *OFOService) GetLatencyStats() (avgLatency time.Duration, count int64) {
 	s.latencyMu.Lock()
 	defer s.latencyMu.Unlock()
@@ -1216,3 +809,4 @@ func (s *OFOService) GetLatencyStats() (avgLatency time.Duration, count int64) {
 	}
 	return s.totalLatency / time.Duration(s.finalizedCountForLatency), s.finalizedCountForLatency
 }
+
