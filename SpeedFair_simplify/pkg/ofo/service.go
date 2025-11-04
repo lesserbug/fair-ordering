@@ -511,6 +511,7 @@ import (
 	"sort"
 	"sync"
 	"time"
+	"reflect"
 )
 
 // Malicious behavior constants (start with slightly lower intensity for easier debugging)
@@ -943,9 +944,72 @@ func (s *OFOService) handleProposal(proposal *types.LeaderProposal) {
 		return
 	}
 
-	s.deferredMu.Lock()
+	// ===================================================================
+	// <<< NEW: REPLICA-SIDE FAIRNESS VERIFICATION >>>
+	// Replicas MUST re-calculate the graph and updates from the proof (π)
+	// and verify they match the leader's proposal.
+	// ===================================================================
+
+	// 1. Get the replica's local committed snapshot.
+	// (Using local state is safer than trusting proposal.CommittedSoFar)
+	s.committedMu.RLock()
+	committedSnapshot := make(map[[32]byte]bool)
+	for id := range s.committedTxIDs {
+		committedSnapshot[id] = true
+	}
+	s.committedMu.RUnlock()
+
+	// 2. Separate orders from the proof
+	newTxOrders, updateOrdersByHeight := s.separateOrderTypes(proposal.Proof.ReplicaOrders)
+
+	// 3. Re-calculate G' (Graph) locally, exactly as the leader would
+	dm_replica := NewDependencyManager()
+	graphBuilt := dm_replica.BuildGraphAndClassifyTxs(
+		newTxOrders,
+		s.replicaCount,
+		s.fFaulty,
+		s.gamma,
+		committedSnapshot,
+	)
+
+	if graphBuilt {
+		dm_replica.CutShadedTail()
+	}
+
+	G_prime := dm_replica.graph
+	States_prime := dm_replica.txStates // We'll use this later
+
+	// 4. Re-calculate E_updates' (Updates) locally
+	// (We must lock deferredMu here to safely read s.deferredProposals)
+	s.deferredMu.Lock() // <<< LOCK MOVED HERE
+
+	E_updates_prime := make(map[uint64]map[[32]byte][][32]byte)
+	for height, uos := range updateOrdersByHeight {
+		// Use the replica's *own* view of deferred proposals
+		if deferredProp, exists := s.deferredProposals[height]; exists {
+			newEdges := FairUpdate(uos, deferredProp.Graph, s.replicaCount, s.fFaulty, s.gamma)
+			if len(newEdges) > 0 {
+				E_updates_prime[height] = newEdges
+			}
+		}
+	}
+
+	// 5. CRITICAL: Compare G vs G' and E_updates vs E_updates'
+	if !equalGraph(proposal.Graph, G_prime) || !equalUpdates(proposal.Updates, E_updates_prime) {
+		// Proposal is NOT FAIR or is inconsistent. Reject it.
+		s.deferredMu.Unlock() // Don't forget to unlock
+		return
+	}
+
+	// ===================================================================
+	// <<< END OF VERIFICATION BLOCK >>>
+	// If we reach this point, the proposal's G and Updates are VERIFIED.
+	// We can now proceed with the original logic, using the verified data.
+	// ===================================================================
+
+	// (Original logic continues...)
 	if proposal.Updates != nil {
-		for height, newEdges := range proposal.Updates {
+		for height, newEdges := range proposal.Updates { // This is now verified
 			if deferredP, ok := s.deferredProposals[height]; ok {
 				for u, vs := range newEdges {
 					for _, v := range vs {
@@ -955,9 +1019,16 @@ func (s *OFOService) handleProposal(proposal *types.LeaderProposal) {
 			}
 		}
 	}
+
 	// Only add non-empty graphs to deferred proposals
-	if proposal.Graph != nil && len(proposal.Graph.Nodes) > 0 {
+	if proposal.Graph != nil && len(proposal.Graph.Nodes) > 0 { // This is now verified
 		if _, exists := s.deferredProposals[proposal.BlockHeight]; !exists {
+
+			// MINIMAL CHANGE for TxStates:
+			// Since G is verified, our locally computed States_prime is correct.
+			// Overwrite the leader's (untrusted) states with our (correct) states.
+			proposal.TxStates = States_prime
+
 			s.deferredProposals[proposal.BlockHeight] = proposal
 		}
 	}
@@ -984,7 +1055,7 @@ func (s *OFOService) handleProposal(proposal *types.LeaderProposal) {
 		clone.Graph = ng
 		deferredProposalsSnapshot[h] = &clone
 	}
-	s.deferredMu.Unlock()
+	s.deferredMu.Unlock() // <<< ORIGINAL UNLOCK
 
 	// The finalization logic remains correct.
 	var allFinalizedTxs [][32]byte
@@ -1011,6 +1082,57 @@ func (s *OFOService) handleProposal(proposal *types.LeaderProposal) {
 	if len(allFinalizedTxs) > 0 {
 		s.commitFinalizedData(allFinalizedTxs, heightsToFinalize)
 	}
+}
+
+func equalGraph(a, b *types.DependencyGraph) bool {
+	if (a == nil) != (b == nil) {
+		return false
+	}
+	if a == nil { // Both are nil
+		return true
+	}
+	// 1. Check Nodes
+	if len(a.Nodes) != len(b.Nodes) {
+		return false
+	}
+	for node := range a.Nodes {
+		if !b.Nodes[node] {
+			return false
+		}
+	}
+	// 2. Check Edges
+	if len(a.Edges) != len(b.Edges) {
+		return false
+	}
+	for u, a_edges := range a.Edges {
+		b_edges, ok := b.Edges[u]
+		if !ok {
+			return false
+		}
+		if len(a_edges) != len(b_edges) {
+			return false
+		}
+		// This assumes edges are sorted, or you need a more complex set comparison
+		// For simplicity, reflect.DeepEqual might be okay if order is deterministic
+		// Let's assume order isn't guaranteed, so we check presence
+		a_set := make(map[[32]byte]bool, len(a_edges))
+		for _, e := range a_edges {
+			a_set[e] = true
+		}
+		for _, e := range b_edges {
+			if !a_set[e] {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// (Helper function)
+func equalUpdates(a, b map[uint64]map[[32]byte][][32]byte) bool {
+	// Using DeepEqual is easiest here
+	return reflect.DeepEqual(a, b)
+	// Manual check is also possible but complex (map[uint64] -> map[[32]byte] -> []bytes)
 }
 
 // ... commitFinalizedData and all Getter methods are unchanged ...
