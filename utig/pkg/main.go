@@ -201,6 +201,15 @@ func runDistributedMode(ctx context.Context, nodeIDs []uint64, maliciousThreshol
 				}
 			}
 		netReady:
+warmup := 2*time.Duration(loIntervalMs)*time.Millisecond + 50*time.Millisecond // +50ms 缓冲
+                        log.Printf("Tx Submitter: network ready. Full pipeline warm-up %v ...", warmup)
+
+                        select {
+                        case <-time.After(warmup): // 等待 Ticker 触发 并且 Collector 也完成首轮收集
+                        case <-ctx.Done():
+                                log.Println("Tx Submitter: shutdown during warm-up.")
+                                return
+                        }
 			submitTransactions(ctx, txSubmitterNet, totalNodes, txRate, &submittedTxCount)
 		}()
 	}
