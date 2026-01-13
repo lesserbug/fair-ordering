@@ -54,6 +54,7 @@ From your local machine, run:
 
 ```powershell
 .\1-prepare-experiment.ps1
+```
 
 This script installs required packages and clones the repository on all EC2 instances.
 
@@ -65,11 +66,13 @@ Choose one of the following scripts depending on the protocol:
 
 ```powershell
 .\run-speedfair-experiment.ps1
+```
 
 ### Run AUTIG
 
 ```powershell
 .\run-utig-experiment.ps1
+```
 
 ## Experiment Parameters
 
@@ -85,7 +88,7 @@ $paramLoSize = 50
 $paramTxRate = 200
 $paramSimDuration = 35
 $leaderWaitDelay = 2
-
+```
 
 ### Parameter Meanings
 
