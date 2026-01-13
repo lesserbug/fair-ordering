@@ -98,7 +98,7 @@ $leaderWaitDelay = 2
 | `$paramGamma` | Fairness parameter $\gamma$ |
 | `$paramLoInterval` | LocalOrder emission interval (ms) |
 | `$paramLoSize` | Maximum transactions per LocalOrder |
-| `$paramTxRate` | Synthetic transaction submission rate (leader only) |
+| `$paramTxRate` | Synthetic transaction submission rate |
 | `$paramSimDuration` | Experiment duration (seconds) |
 | `$leaderWaitDelay` | Delay before starting the leader to allow replicas to connect |
 
