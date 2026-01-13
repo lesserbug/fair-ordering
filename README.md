@@ -1,11 +1,12 @@
-# Fair ordering Protocols — 5-Node EC2 Deployment Guide
+# Fair Ordering Protocols — EC2 Experiment Deployment (Script-Based)
 
-This repository provides a guide for running both Themis and AUTIG consensus protocol implementations across 5 EC2 instances (one node per instance).
+This repository contains implementations and experiment tooling for two order-fair consensus protocols, **Themis** and **AUTIG**.  
+The current version supports **script-based deployment and execution** across multiple EC2 instances, replacing the previous manual per-instance setup.
 
 ## Protocols
 
-- **Themis (Order-Fairness)** - Located in `SpeedFair_simplify/` folder
-- **AUTIG** - Located in `utig/` folder
+- **Themis (Order-Fairness)** — located in `SpeedFair_simplify/`
+- **AUTIG** — located in `utig/`
 
 ## Overview
 
@@ -15,160 +16,107 @@ Both protocols follow the same basic pattern:
 
 **AUTIG:** Uses similar consensus mechanics with the same configuration parameters and deployment process.
 
-The program prints TPS and average latency during the run and a summary at the end.
+Experiment results (throughput and latency) are recorded to a log file on the **leader node**.
+
+## Automation Scripts
+
+The experiment workflow is fully automated using three PowerShell scripts:
+
+- `1-prepare-experiment.ps1`  
+  Prepares all EC2 instances by installing dependencies and cloning this repository.
+
+- `run-speedfair-experiment.ps1`  
+  Runs the **Themis** experiment across the cluster.
+
+- `run-utig-experiment.ps1`  
+  Runs the **AUTIG** experiment across the cluster.
+
+These scripts eliminate the need for manual SSH sessions and ensure consistent configuration across experiments.
 
 ## Requirements
 
 - Go 1.22+
-- 5 Linux EC2 instances (same VPC/subnet recommended)
-- Security group rules that allow the chosen TCP port between all instances
-- The same `config.json` present on every instance
+- Multiple Linux EC2 instances (one node per instance recommended)
+- All instances in the same VPC/subnet
+- Security group rules allowing the experiment TCP port between all instances
+- PowerShell (Windows PowerShell 5.1+ or PowerShell 7+) on the local machine
+- SSH key access to all EC2 instances
 
-## Setup Instructions
+## Quick Start
 
-### 1. Create config.json
+### Step 0 — Launch EC2 Instances
 
-Create a configuration file listing all replicas (0..4). Use private VPC IPs (do not use 0.0.0.0 or 127.0.0.1).
-Since we run one node per instance, we reuse port 8000 on each host.
+Launch the desired number of EC2 instances and ensure they can communicate over private IP addresses within the VPC.
 
-```json
-{
-  "nodes": {
-    "0": "10.0.0.10:8000",
-    "1": "10.0.1.11:8000",
-    "2": "10.0.2.12:8000",
-    "3": "10.0.3.13:8000",
-    "4": "10.0.4.14:8000"
-  }
-}
-```
+### Step 1 — Prepare Environment
 
-**Notes:**
-- Node 0 is the leader (assumed by the code)
-- All 5 entries must appear in every instance's `config.json`
-- If you later colocate multiple nodes on one machine, give them distinct ports
+From your local machine, run:
 
-### 2. Configure Security Group
+```powershell
+.\1-prepare-experiment.ps1
 
-**Inbound:** Allow TCP 8000 from the same security group (or from the 5 private IPs / VPC CIDR).
+This script installs required packages and clones the repository on all EC2 instances.
 
-**Outbound:** Allow all (default is fine).
+## Step 2 — Run Experiments
 
-### 3. Install Go & Clone Repository
+Choose one of the following scripts depending on the protocol:
 
-Run on each EC2 instance:
+### Run Themis
 
-```bash
-sudo apt-get update -y && sudo apt-get install -y git
-# Install Go 1.22+ via your preferred method (snap/tarball/pkg manager)
-git clone <YOUR_REPO_URL> consensus-protocols
-cd consensus-protocols
-```
+```powershell
+.\run-speedfair-experiment.ps1
 
-#### For Themis:
+### Run AUTIG
 
-```bash
-cd SpeedFair_simplify
-```
+```powershell
+.\run-utig-experiment.ps1
 
-Optionally build the binary:
+## Experiment Parameters
 
-```bash
-go build -o themis
-# You can also run without building: `go run main.go ...`
-```
+All experiment parameters are configured inside the run scripts.
 
-#### For AUTIG:
+You can modify them by editing the following variables (example):
 
-```bash
-cd utig
-```
+```powershell
+$paramF = 8
+$paramGamma = 1
+$paramLoInterval = 400
+$paramLoSize = 50
+$paramTxRate = 200
+$paramSimDuration = 35
+$leaderWaitDelay = 2
 
-Optionally build the binary:
 
-```bash
-go build -o autig
-# You can also run without building: `go run main.go ...`
-```
+### Parameter Meanings
 
-### 4. Run the Cluster
+| Parameter | Description |
+| :--- | :--- |
+| `$paramF` | Tolerated Byzantine replicas ($f$) |
+| `$paramGamma` | Fairness parameter $\gamma$ |
+| `$paramLoInterval` | LocalOrder emission interval (ms) |
+| `$paramLoSize` | Maximum transactions per LocalOrder |
+| `$paramTxRate` | Synthetic transaction submission rate (leader only) |
+| `$paramSimDuration` | Experiment duration (seconds) |
+| `$leaderWaitDelay` | Delay before starting the leader to allow replicas to connect |
 
-We use parameters: n=5, f=1, γ=1, lo-interval=250ms, lo-size=100, tx-rate=400, sim-duration=60s.
+> **Note:** In the current implementation, only the leader process (node 0) generates client transactions.
 
-**Important:** Per the current code, only the leader process (node 0) emits client transactions.
+## Output and Logs
 
-You can use either `go run` (no build) or the built binary.
+Experiment output is not printed to the terminal. Instead, all metrics are written to a log file on the **leader node**:
 
-#### Running Themis
+`bft.log`
 
-Navigate to the `SpeedFair_simplify/` directory on each instance, then run:
+This file contains periodic measurements and final summaries, including:
 
-**Instance A (10.0.0.10) — Node 0 (Leader):**
+* Total submitted transactions
+* Total finalized transactions
+* Throughput (TPS)
+* Average latency
 
-```bash
-go run main.go -config="config.json" -nodes="0" \
-  -f=1 -gamma=1 \
-  -lo-interval=250 -lo-size=100 \
-  -tx-rate=400 \
-  -sim-duration=60
-```
+### Example final summary (excerpt from `bft.log`):
 
-**Instance B (10.0.1.11) — Node 1:**
-
-```bash
-go run main.go -config="config.json" -nodes="1" \
-  -f=1 -gamma=1 \
-  -lo-interval=250 -lo-size=100 \
-  -tx-rate=400 \
-  -sim-duration=60
-```
-
-**Instance C (10.0.2.12) — Node 2:**
-
-```bash
-go run main.go -config="config.json" -nodes="2" \
-  -f=1 -gamma=1 \
-  -lo-interval=250 -lo-size=100 \
-  -tx-rate=400 \
-  -sim-duration=60
-```
-
-**Instance D (10.0.3.13) — Node 3:**
-
-```bash
-go run main.go -config="config.json" -nodes="3" \
-  -f=1 -gamma=1 \
-  -lo-interval=250 -lo-size=100 \
-  -tx-rate=400 \
-  -sim-duration=60
-```
-
-**Instance E (10.0.4.14) — Node 4:**
-
-```bash
-go run main.go -config="config.json" -nodes="4" \
-  -f=1 -gamma=1 \
-  -lo-interval=250 -lo-size=100 \
-  -tx-rate=400 \
-  -sim-duration=60
-```
-
-#### Running AUTIG
-
-Navigate to the `utig/` directory on each instance, then run the same commands as above. AUTIG uses identical configuration parameters and command structure.
-
-## Expected Output
-
-After "waiting for peers…", processes begin printing periodic metrics:
-
-```
-[12.0s] Finalized: 2150 | Submitted: 4800 | TPS: 179.18 |
-Latency: 560ms | Pool: 940 | LastOrder: 101
-```
-
-At the end:
-
-```
+```text
 --- FINAL RESULTS (Themis) ---
 Total Submitted: 24000
 Total Finalized: 10850
@@ -176,24 +124,9 @@ Throughput: 180.83 TPS
 Average Latency: 574ms (from 10850 txs)
 ```
 
-## Command Line Flags
-
-| Flag | Type | Description |
-|------|------|-------------|
-| `-config` | string | Path to JSON config of node addresses |
-| `-nodes` | string | IDs to run on this instance, e.g. "0" |
-| `-f` | uint | Tolerated Byzantine replicas (for 5 nodes set to 1) |
-| `-gamma` | float | Fairness parameter γ (e.g., 0.9) |
-| `-lo-interval` | ms | LocalOrder emission period |
-| `-lo-size` | int | Max transactions per LocalOrder |
-| `-tx-rate` | tx/s | Synthetic client submission rate (effective on leader process) |
-| `-sim-duration` | s | Run duration |
-| `-cpuprofile` | bool | Write a local CPU profile (themis_cpu_nodes_*.pprof) |
-
-
 ## Repository Structure (Themis)
 
-```
+```text
 ├── main.go                          # Entry point & runner
 ├── pkg/
 │   ├── network/
@@ -205,3 +138,4 @@ Average Latency: 574ms (from 10850 txs)
 │       └── types.go                # Types & messages
 └── config.json                     # Cluster addresses
 ```
+
